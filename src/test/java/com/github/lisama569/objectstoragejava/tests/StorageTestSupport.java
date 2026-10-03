@@ -8,6 +8,7 @@ import com.github.lisama569.objectstoragejava.dto.UploadInitResponse;
 import com.github.lisama569.objectstoragejava.service.ChecksumService;
 import com.github.lisama569.objectstoragejava.service.LockManager;
 import com.github.lisama569.objectstoragejava.service.ObjectStorageService;
+import com.github.lisama569.objectstoragejava.service.ReadGate;
 import com.github.lisama569.objectstoragejava.service.StorageLayout;
 
 import java.io.ByteArrayInputStream;
@@ -22,7 +23,7 @@ final class StorageTestSupport {
     private StorageTestSupport() {
     }
 
-    record Stack(Path root, ObjectStorageService service, ChecksumService checksums) {
+    record Stack(Path root, ObjectStorageService service, ChecksumService checksums, ReadGate readGate) {
     }
 
     static Stack newStack(Path root) {
@@ -30,8 +31,9 @@ final class StorageTestSupport {
         StorageLayout layout = new StorageLayout(properties);
         layout.initialize();
         ChecksumService checksums = new ChecksumService();
-        ObjectStorageService service = new ObjectStorageService(layout, checksums, new LockManager());
-        return new Stack(root, service, checksums);
+        ReadGate readGate = new ReadGate();
+        ObjectStorageService service = new ObjectStorageService(layout, checksums, new LockManager(), readGate);
+        return new Stack(root, service, checksums, readGate);
     }
 
     static String sha256(ChecksumService checksums, byte[] data) {

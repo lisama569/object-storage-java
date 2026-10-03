@@ -29,12 +29,14 @@ public class StorageLayout {
     private final Path blobsDir;
     private final Path objectsDir;
     private final Path stagingDir;
+    private final Path quarantineDir;
 
     public StorageLayout(StorageProperties properties) {
         this.root = Path.of(properties.root()).toAbsolutePath().normalize();
         this.blobsDir = this.root.resolve("blobs");
         this.objectsDir = this.root.resolve("objects");
         this.stagingDir = this.root.resolve("staging");
+        this.quarantineDir = this.blobsDir.resolve(".quarantine");
     }
 
     /** Validate an object name and return it unchanged. */
@@ -82,12 +84,18 @@ public class StorageLayout {
         return uploadDir(objectName, uploadId).resolve("parts").resolve("part-" + partNumber);
     }
 
+    /** Two-phase GC staging area: unreferenced blobs are moved here before final deletion. */
+    public Path quarantineDir() {
+        return quarantineDir;
+    }
+
     /** Create the top-level directories. Called once at application startup. */
     public void initialize() {
         try {
             Files.createDirectories(blobsDir);
             Files.createDirectories(objectsDir);
             Files.createDirectories(stagingDir);
+            Files.createDirectories(quarantineDir);
         } catch (IOException e) {
             throw new StorageException("Failed to initialise storage root: " + root, e);
         }

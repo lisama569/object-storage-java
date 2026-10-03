@@ -1,12 +1,16 @@
 package com.github.lisama569.objectstoragejava.service;
 
+import com.fasterxml.jackson.databind.DeserializationFeature;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.github.lisama569.objectstoragejava.dto.ChunkUploadResponse;
 import com.github.lisama569.objectstoragejava.dto.ManifestEntry;
 import com.github.lisama569.objectstoragejava.dto.ManifestRequest;
+import com.github.lisama569.objectstoragejava.dto.PruneResult;
+import com.github.lisama569.objectstoragejava.dto.RangeReadResult;
 import com.github.lisama569.objectstoragejava.dto.StoredObject;
 import com.github.lisama569.objectstoragejava.dto.UploadInitResponse;
 import com.github.lisama569.objectstoragejava.dto.UploadStatusResponse;
+import com.github.lisama569.objectstoragejava.dto.VersionSummary;
 import com.github.lisama569.objectstoragejava.exception.ChecksumMismatchException;
 import com.github.lisama569.objectstoragejava.exception.InvalidManifestException;
 import com.github.lisama569.objectstoragejava.exception.StorageException;
@@ -50,12 +54,16 @@ public class ObjectStorageService {
     private final StorageLayout layout;
     private final ChecksumService checksumService;
     private final LockManager lockManager;
-    private final ObjectMapper objectMapper = new ObjectMapper();
+    private final ReadGate readGate;
+    private final ObjectMapper objectMapper = new ObjectMapper()
+            .configure(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES, false);
 
-    public ObjectStorageService(StorageLayout layout, ChecksumService checksumService, LockManager lockManager) {
+    public ObjectStorageService(StorageLayout layout, ChecksumService checksumService,
+                                LockManager lockManager, ReadGate readGate) {
         this.layout = layout;
         this.checksumService = checksumService;
         this.lockManager = lockManager;
+        this.readGate = readGate;
     }
 
     // ---------------------------------------------------------------- multipart sessions
@@ -395,10 +403,50 @@ public class ObjectStorageService {
         }
     }
 
-    // ------------------------------------------------------------------ reads
+    // --------------------------------------------------------- new read / lifecycle APIs
 
-    public StoredObject headObject(String objectName) {
-        layout.requireSafeName(objectName);
+    /** Read a byte range of the current version from a single consistent metadata snapshot. */
+    public RangeReadResult readObjectRange(String objectName, String rangeHeader) {
+        return null;
+    }
+
+    /** Read a byte range of a specific historical version. */
+    public RangeReadResult readVersionRange(String objectName, long version, String rangeHeader) {
+        return null;
+    }
+
+    /** Open the verified byte stream of one already-resolved immutable version snapshot. */
+    public InputStream openVersion(StoredObject version) {
+        return openVersionStream(version, null);
+    }
+
+    /** Open a verified stream for the given version, optionally limited to an inclusive range. */
+    public InputStream openVersionStream(StoredObject version, ByteRange range) {
+        return null;
+    }
+
+    /** List all committed versions of an object (version numbers ascending). */
+    public java.util.List<VersionSummary> listVersions(String objectName) {
+        return java.util.List.of();
+    }
+
+    /** Remove historical versions beyond the given retention count; current is never removed. */
+    public PruneResult pruneVersions(String objectName, int retain) {
+        return null;
+    }
+
+    /** Delete the whole object (all versions + pointer); its blobs become GC candidates. */
+    public void deleteObject(String objectName) {
+    }
+
+    /** Snapshot of every part checksum referenced by any still-readable version of any object. */
+    public java.util.Set<String> collectLiveBlobChecksums() {
+        return java.util.Set.of();
+    }
+
+    // ------------------------------------------------------------------ reads (legacy)
+
+    public StoredObject headObject(String objectName) {        layout.requireSafeName(objectName);
         StoredObject current = currentVersionOrNull(objectName);
         if (current == null) {
             throw new UploadNotFoundException("No committed version of object " + objectName);
@@ -421,30 +469,6 @@ public class ObjectStorageService {
 
     public InputStream readVersion(String objectName, long version) {
         return openVersion(getVersion(objectName, version));
-    }
-
-    private InputStream openVersion(StoredObject version) {
-        // Lazily open each blob exactly when the previous one is exhausted. Opening all streams
-        // up-front would leak file descriptors and, under concurrency, risk reading a descriptor
-        // that belongs to a different caller's blob.
-        java.util.Iterator<String> checksums = version.partChecksums().iterator();
-        java.util.Enumeration<InputStream> streams = new java.util.Enumeration<>() {
-            @Override
-            public boolean hasMoreElements() {
-                return checksums.hasNext();
-            }
-
-            @Override
-            public InputStream nextElement() {
-                String checksum = checksums.next();
-                try {
-                    return Files.newInputStream(layout.blob(checksum));
-                } catch (IOException e) {
-                    throw new StorageException("Blob " + checksum + " is unreadable", e);
-                }
-            }
-        };
-        return new java.io.SequenceInputStream(streams);
     }
 
     private StoredObject currentVersionOrNull(String objectName) {
