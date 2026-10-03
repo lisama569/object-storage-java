@@ -5,6 +5,7 @@ import com.github.lisama569.objectstoragejava.dto.ManifestEntry;
 import com.github.lisama569.objectstoragejava.dto.ManifestRequest;
 import com.github.lisama569.objectstoragejava.dto.StoredObject;
 import com.github.lisama569.objectstoragejava.dto.UploadInitResponse;
+import com.github.lisama569.objectstoragejava.service.BlobLeaseManager;
 import com.github.lisama569.objectstoragejava.service.ChecksumService;
 import com.github.lisama569.objectstoragejava.service.LockManager;
 import com.github.lisama569.objectstoragejava.service.ObjectStorageService;
@@ -17,29 +18,32 @@ import java.util.ArrayList;
 import java.util.List;
 
 /** Shared helpers: wires a real service stack against a JUnit-managed temp directory. */
-final class StorageTestSupport {
+public final class StorageTestSupport {
 
     private StorageTestSupport() {
     }
 
-    record Stack(Path root, ObjectStorageService service, ChecksumService checksums) {
+    public record Stack(Path root, ObjectStorageService service, ChecksumService checksums,
+                 BlobLeaseManager leaseManager) {
     }
 
-    static Stack newStack(Path root) {
+    public static Stack newStack(Path root) {
         StorageProperties properties = new StorageProperties(root.toString());
         StorageLayout layout = new StorageLayout(properties);
         layout.initialize();
         ChecksumService checksums = new ChecksumService();
-        ObjectStorageService service = new ObjectStorageService(layout, checksums, new LockManager());
-        return new Stack(root, service, checksums);
+        BlobLeaseManager leaseManager = new BlobLeaseManager();
+        ObjectStorageService service = new ObjectStorageService(layout, checksums, new LockManager(),
+                leaseManager);
+        return new Stack(root, service, checksums, leaseManager);
     }
 
-    static String sha256(ChecksumService checksums, byte[] data) {
+    public static String sha256(ChecksumService checksums, byte[] data) {
         return checksums.sha256(new ByteArrayInputStream(data));
     }
 
     /** Upload all parts and complete; returns the published (or reused) version. */
-    static StoredObject multipartUpload(ObjectStorageService service, ChecksumService checksums,
+    public static StoredObject multipartUpload(ObjectStorageService service, ChecksumService checksums,
                                         String objectName, List<byte[]> parts, String uploadId) {
         List<ManifestEntry> entries = new ArrayList<>();
         List<String> partChecksums = new ArrayList<>();
@@ -54,13 +58,13 @@ final class StorageTestSupport {
         return service.completeUpload(objectName, uploadId, new ManifestRequest(objectChecksum, entries));
     }
 
-    static StoredObject multipartUpload(ObjectStorageService service, ChecksumService checksums,
+    public static StoredObject multipartUpload(ObjectStorageService service, ChecksumService checksums,
                                         String objectName, List<byte[]> parts) {
         UploadInitResponse init = service.initUpload(objectName);
         return multipartUpload(service, checksums, objectName, parts, init.uploadId());
     }
 
-    static byte[] concat(List<byte[]> parts) {
+    public static byte[] concat(List<byte[]> parts) {
         int total = parts.stream().mapToInt(p -> p.length).sum();
         byte[] all = new byte[total];
         int offset = 0;
@@ -71,7 +75,7 @@ final class StorageTestSupport {
         return all;
     }
 
-    static byte[] utf8(String s) {
+    public static byte[] utf8(String s) {
         return s.getBytes(StandardCharsets.UTF_8);
     }
 }

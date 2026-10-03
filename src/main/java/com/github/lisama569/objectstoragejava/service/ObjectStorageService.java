@@ -50,12 +50,15 @@ public class ObjectStorageService {
     private final StorageLayout layout;
     private final ChecksumService checksumService;
     private final LockManager lockManager;
+    private final BlobLeaseManager leaseManager;
     private final ObjectMapper objectMapper = new ObjectMapper();
 
-    public ObjectStorageService(StorageLayout layout, ChecksumService checksumService, LockManager lockManager) {
+    public ObjectStorageService(StorageLayout layout, ChecksumService checksumService,
+                                LockManager lockManager, BlobLeaseManager leaseManager) {
         this.layout = layout;
         this.checksumService = checksumService;
         this.lockManager = lockManager;
+        this.leaseManager = leaseManager;
     }
 
     // ---------------------------------------------------------------- multipart sessions
@@ -248,16 +251,26 @@ public class ObjectStorageService {
                         + manifest.checksum() + " but assembled object has " + computedChecksum);
             }
 
+            // Content identity: SHA-256 over the raw concatenated bytes. Unlike the chained
+            // manifest checksum above, this is independent of how the upload was split into parts.
+            String contentChecksum = sha256AssembledBytes(objectName, uploadId, entries.size());
+
             StoredObject result;
-            StoredObject current = currentVersionOrNull(objectName);
-            if (current != null && current.checksum().equalsIgnoreCase(computedChecksum)) {
-                // Identical content re-upload: no new version, no extra storage.
-                result = new StoredObject(objectName, current.version(), current.checksum(),
-                        current.size(), current.partChecksums(), true);
-                log.info("Duplicate upload object={} checksum={} -> reuse version {} (no new storage)",
-                        objectName, computedChecksum, current.version());
+            // Duplicate decision for THIS object: identical raw bytes already present on one of its
+            // readable versions -> reuse that version (no new version, no new storage), regardless
+            // of the part layout used this time. Genuinely changed bytes -> publish a new version.
+            // Cross-object storage sharing is provided independently by content-addressed blobs
+            // (materialiseBlob reuses any identical blob even when a new version is published here).
+            StoredObject duplicate = findVersionByContent(objectName, contentChecksum);
+            if (duplicate != null) {
+                result = new StoredObject(objectName, duplicate.version(), duplicate.checksum(),
+                        duplicate.contentChecksum(), duplicate.size(), duplicate.partChecksums(), true);
+                log.info("[dedup] decision object={} contentChecksum={} -> reuse existing version {} "
+                                + "(possibly different part layout; no new version, no new storage)",
+                        objectName, contentChecksum, duplicate.version());
             } else {
-                result = publishVersion(objectName, uploadId, partChecksums, computedChecksum, totalSize);
+                result = publishVersion(objectName, uploadId, partChecksums, computedChecksum,
+                        contentChecksum, totalSize);
             }
 
             // Staging is only removed after publication; a failure before here leaves it resumable.
@@ -280,21 +293,25 @@ public class ObjectStorageService {
      */
     private StoredObject publishVersion(String objectName, String uploadId,
                                         List<String> partChecksums, String objectChecksum,
-                                        long totalSize) throws IOException {
-        // Ensure every referenced content blob exists exactly once (deduplicated).
-        int reusedBlobs = 0;
-        for (int i = 0; i < partChecksums.size(); i++) {
-            int partNumber = i + 1;
-            Path partFile = layout.partFile(objectName, uploadId, partNumber);
-            if (materialiseBlob(partFile, partChecksums.get(i))) {
-                reusedBlobs++;
+                                        String contentChecksum, long totalSize) throws IOException {
+        // Protect every referenced blob for the whole materialise -> write metadata -> flip
+        // pointer window, so a concurrent GC pass can never reclaim a not-yet-referenced blob.
+        leaseManager.markPending(partChecksums);
+        try {
+            // Ensure every referenced content blob exists exactly once (deduplicated).
+            int reusedBlobs = 0;
+            for (int i = 0; i < partChecksums.size(); i++) {
+                int partNumber = i + 1;
+                Path partFile = layout.partFile(objectName, uploadId, partNumber);
+                if (materialiseBlob(partFile, partChecksums.get(i))) {
+                    reusedBlobs++;
+                }
             }
-        }
 
-        long nextVersion = nextVersionNumber(objectName);
-        boolean allBlobsReused = reusedBlobs == partChecksums.size();
-        StoredObject stored = new StoredObject(objectName, nextVersion, objectChecksum, totalSize,
-                List.copyOf(partChecksums), allBlobsReused);
+            long nextVersion = nextVersionNumber(objectName);
+            boolean allBlobsReused = reusedBlobs == partChecksums.size();
+            StoredObject stored = new StoredObject(objectName, nextVersion, objectChecksum, contentChecksum,
+                    totalSize, List.copyOf(partChecksums), false);
 
         // Write version metadata to a temp file, then atomically rename into versions/.
         Path versionsDir = layout.versionsDir(objectName);
@@ -310,18 +327,22 @@ public class ObjectStorageService {
         }
 
         // Flip the pointer atomically. Old version files and blobs are never touched.
-        Path pointer = layout.currentPointer(objectName);
-        Files.createDirectories(pointer.getParent());
-        Path tmpPointer = Files.createTempFile(pointer.getParent(), "current-", ".tmp");
-        try {
-            Files.writeString(tmpPointer, Long.toString(nextVersion), StandardCharsets.UTF_8);
-            atomicMove(tmpPointer, pointer);
+            Path pointer = layout.currentPointer(objectName);
+            Files.createDirectories(pointer.getParent());
+            Path tmpPointer = Files.createTempFile(pointer.getParent(), "current-", ".tmp");
+            try {
+                Files.writeString(tmpPointer, Long.toString(nextVersion), StandardCharsets.UTF_8);
+                atomicMove(tmpPointer, pointer);
+            } finally {
+                deleteQuietly(tmpPointer);
+            }
+            log.info("[version] decision object={} content differs -> publish version={} manifestChecksum={} "
+                            + "contentChecksum={} size={} reusedBlobs={}",
+                    objectName, nextVersion, objectChecksum, contentChecksum, totalSize, reusedBlobs);
+            return stored;
         } finally {
-            deleteQuietly(tmpPointer);
+            leaseManager.clearPending(partChecksums);
         }
-        log.info("Published version object={} version={} checksum={} size={} reusedBlobs={}",
-                objectName, nextVersion, objectChecksum, totalSize, reusedBlobs);
-        return stored;
     }
 
     /**
@@ -412,39 +433,273 @@ public class ObjectStorageService {
         if (!Files.exists(vFile)) {
             throw new UploadNotFoundException("Version " + version + " of object " + objectName + " does not exist");
         }
+        if (Files.exists(layout.retiredMarker(objectName, version))) {
+            throw new UploadNotFoundException("Version " + version + " of object " + objectName
+                    + " has been retired and is no longer readable");
+        }
         return readVersionFile(vFile);
     }
 
     public InputStream readObject(String objectName) {
-        return openVersion(headObject(objectName));
+        return openCurrent(objectName, null).stream();
     }
 
     public InputStream readVersion(String objectName, long version) {
-        return openVersion(getVersion(objectName, version));
+        return openVersionSnapshot(objectName, version, null).stream();
     }
 
-    private InputStream openVersion(StoredObject version) {
-        // Lazily open each blob exactly when the previous one is exhausted. Opening all streams
-        // up-front would leak file descriptors and, under concurrency, risk reading a descriptor
-        // that belongs to a different caller's blob.
-        java.util.Iterator<String> checksums = version.partChecksums().iterator();
-        java.util.Enumeration<InputStream> streams = new java.util.Enumeration<>() {
+    // ------------------------------------------------- snapshot reads / ranges / retirement
+
+    /**
+     * Open the current version against a SINGLE metadata snapshot and return its metadata together
+     * with the stream. Metadata and bytes therefore always describe the same complete version, even
+     * if another writer publishes concurrently: the snapshot is resolved once here and the returned
+     * stream reads exactly that snapshot's blobs.
+     */
+    public com.github.lisama569.objectstoragejava.dto.OpenedObject openCurrent(
+            String objectName, String rangeHeader) {
+        layout.requireSafeName(objectName);
+        return openSnapshot(headObject(objectName), rangeHeader);
+    }
+
+    /** Open one historical (or current, by number) version against a single metadata snapshot. */
+    public com.github.lisama569.objectstoragejava.dto.OpenedObject openVersionSnapshot(
+            String objectName, long version, String rangeHeader) {
+        layout.requireSafeName(objectName);
+        return openSnapshot(getVersion(objectName, version), rangeHeader);
+    }
+
+    private com.github.lisama569.objectstoragejava.dto.OpenedObject openSnapshot(
+            StoredObject meta, String rangeHeader) {
+        com.github.lisama569.objectstoragejava.dto.ByteRange range =
+                com.github.lisama569.objectstoragejava.dto.ByteRange.parse(rangeHeader, meta.size());
+
+        // Determine which part blobs the (optional) range touches. The lease protects exactly
+        // those blobs from GC until the stream is closed; the blob boundaries come from this one
+        // immutable metadata snapshot, so metadata and bytes can never disagree.
+        List<String> referenced = meta.partChecksums();
+        List<String> touched;
+        if (range == null) {
+            touched = referenced;
+        } else {
+            touched = touchedChecksums(meta, range.start(), range.end());
+        }
+        BlobLeaseManager.Lease lease = leaseManager.acquire(touched);
+        boolean handedOff = false;
+        try {
+            InputStream stream = range == null
+                    ? openVerifiedSequence(meta, 0, meta.size() - 1, lease)
+                    : openVerifiedSequence(meta, range.start(), range.end(), lease);
+            com.github.lisama569.objectstoragejava.dto.OpenedObject opened =
+                    new com.github.lisama569.objectstoragejava.dto.OpenedObject(meta, stream, range);
+            handedOff = true;
+            return opened;
+        } finally {
+            // openVerifiedSequence wraps the lease into the stream; if construction failed before
+            // the hand-off, release here to avoid leaking the protection counts.
+            if (!handedOff) {
+                lease.close();
+            }
+        }
+    }
+
+    /**
+     * Return the checksums of the blobs overlapping the inclusive [from, to] byte window.
+     * Blob boundaries are reconstructed by summing each blob's on-disk size; the version metadata
+     * guarantees those sizes add up to {@code size}.
+     */
+    private List<String> touchedChecksums(StoredObject meta, long from, long to) {
+        long offset = 0;
+        List<String> result = new ArrayList<>();
+        for (String checksum : meta.partChecksums()) {
+            long blobSize;
+            try {
+                blobSize = Files.size(layout.blob(checksum));
+            } catch (IOException e) {
+                throw new StorageException("Blob " + checksum + " referenced by version "
+                        + meta.version() + " is unreadable", e);
+            }
+            long blobEnd = offset + blobSize - 1;
+            if (blobEnd >= from && offset <= to) {
+                result.add(checksum);
+            }
+            offset += blobSize;
+        }
+        if (result.isEmpty()) {
+            throw new StorageException("No blobs back range [" + from + "," + to + "] for version "
+                    + meta.version() + " — storage is corrupt");
+        }
+        return result;
+    }
+
+    /**
+     * Open the byte window [from, to] of a version, verifying the SHA-256 of EVERY blob the window
+     * touches (including blobs a cross-chunk range starts/ends in the middle of). Bytes outside the
+     * window are skipped but still hashed, so part-integrity checking is never weakened by ranging.
+     * The returned stream closes the lease when closed.
+     */
+    private InputStream openVerifiedSequence(StoredObject meta, long from, long to,
+                                             BlobLeaseManager.Lease lease) {
+        java.util.List<InputStream> layers = new ArrayList<>();
+        long offset = 0;
+        try {
+            for (String checksum : meta.partChecksums()) {
+                Path blob = layout.blob(checksum);
+                long blobSize = Files.size(blob);
+                long blobEnd = offset + blobSize - 1;
+                if (blobEnd >= from && offset <= to) {
+                    long skipPrefix = Math.max(0, from - offset);
+                    long takeUntil = Math.min(blobEnd, to);
+                    long emitLength = takeUntil - offset - skipPrefix + 1;
+                    InputStream verified = new VerifiedBlobInputStream(
+                            Files.newInputStream(blob), blobSize, checksum,
+                            offset, skipPrefix, emitLength, meta.version());
+                    layers.add(verified);
+                }
+                offset += blobSize;
+            }
+        } catch (IOException e) {
+            layers.forEach(in -> {
+                try {
+                    in.close();
+                } catch (IOException ignored) {
+                    // best effort
+                }
+            });
+            lease.close();
+            throw new StorageException("Failed to open version " + meta.version() + " for reading", e);
+        }
+        InputStream sequence = layers.isEmpty()
+                ? InputStream.nullInputStream()
+                : new java.io.SequenceInputStream(java.util.Collections.enumeration(layers));
+        return new InputStream() {
             @Override
-            public boolean hasMoreElements() {
-                return checksums.hasNext();
+            public int read() throws IOException {
+                return sequence.read();
             }
 
             @Override
-            public InputStream nextElement() {
-                String checksum = checksums.next();
+            public int read(byte[] b, int off, int len) throws IOException {
+                return sequence.read(b, off, len);
+            }
+
+            @Override
+            public void close() throws IOException {
                 try {
-                    return Files.newInputStream(layout.blob(checksum));
-                } catch (IOException e) {
-                    throw new StorageException("Blob " + checksum + " is unreadable", e);
+                    sequence.close();
+                } finally {
+                    lease.close();
                 }
             }
         };
-        return new java.io.SequenceInputStream(streams);
+    }
+
+    /** List all versions of an object with their accessibility state (CURRENT/LIVE/RETIRED). */
+    public java.util.List<com.github.lisama569.objectstoragejava.dto.VersionInfo> listVersions(
+            String objectName) {
+        layout.requireSafeName(objectName);
+        Path objectDir = layout.objectDir(objectName);
+        if (!Files.isDirectory(objectDir)) {
+            throw new UploadNotFoundException("No committed version of object " + objectName);
+        }
+        long currentVersion = -1;
+        Path pointer = layout.currentPointer(objectName);
+        if (Files.exists(pointer)) {
+            try {
+                currentVersion = Long.parseLong(Files.readString(pointer, StandardCharsets.UTF_8).trim());
+            } catch (IOException | NumberFormatException e) {
+                throw new StorageException("Failed to read current pointer for " + objectName, e);
+            }
+        }
+        List<com.github.lisama569.objectstoragejava.dto.VersionInfo> result = new ArrayList<>();
+        final long currentV = currentVersion;
+        Path versionsDir = layout.versionsDir(objectName);
+        if (Files.isDirectory(versionsDir)) {
+            try (Stream<Path> files = Files.list(versionsDir)) {
+                files.filter(p -> p.getFileName().toString().matches("v\\d+\\.json"))
+                        .sorted(java.util.Comparator.comparingLong(ObjectStorageService::versionNumberOf))
+                        .forEach(vFile -> result.add(toVersionInfo(objectName, versionNumberOf(vFile),
+                                readVersionFile(vFile), currentV)));
+            } catch (IOException e) {
+                throw new StorageException("Failed to list versions of " + objectName, e);
+            }
+        }
+        return result;
+    }
+
+    /**
+     * Retire a historical version. Retirement places an atomic tombstone marker next to the
+     * immutable {@code vN.json}; bytes are never deleted here. A retired version:
+     * <ul>
+     *     <li>is no longer readable ({@code 404 not_found}) and is excluded from duplicate reuse;</li>
+     *     <li>still appears in the version listing as {@code RETIRED} (its metadata is retained);</li>
+     *     <li>makes its exclusively-held blobs garbage-collection candidates after the grace age.</li>
+     * </ul>
+     * The CURRENT version cannot be retired (409) — upload a replacement first.
+     */
+    public com.github.lisama569.objectstoragejava.dto.VersionInfo retireVersion(
+            String objectName, long version) {
+        layout.requireSafeName(objectName);
+        Lock lock = lockManager.lockFor(objectName);
+        lock.lock();
+        try {
+            StoredObject stored = getVersion(objectName, version); // 404 if missing
+            long currentVersion = currentVersionNumber(objectName);
+            if (version == currentVersion) {
+                throw new com.github.lisama569.objectstoragejava.exception.VersionConflictException(
+                        "Version " + version + " is the current version of " + objectName
+                                + " and cannot be retired while current");
+            }
+            Path marker = layout.retiredMarker(objectName, version);
+            long now = System.currentTimeMillis();
+            Path tmp;
+            try {
+                tmp = Files.createTempFile(marker.getParent(), "v" + version + "-", ".retired.tmp");
+                Files.writeString(tmp, Long.toString(now), StandardCharsets.UTF_8);
+                atomicMove(tmp, marker);
+            } catch (IOException e) {
+                throw new StorageException("Failed to retire version " + version + " of " + objectName, e);
+            }
+            // Protect blobs briefly so a GC already iterating cannot delete them before this call
+            // returns to clients that may still hold the pre-retirement metadata snapshot.
+            try (BlobLeaseManager.Lease ignored = leaseManager.acquire(stored.partChecksums())) {
+                log.info("[retire] object={} version={} retired; its exclusive blobs are now GC candidates",
+                        objectName, version);
+            }
+            return toVersionInfo(objectName, version, stored, currentVersion);
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    private com.github.lisama569.objectstoragejava.dto.VersionInfo toVersionInfo(
+            String objectName, long version, StoredObject stored, long currentVersion) {
+        boolean retired = Files.exists(layout.retiredMarker(objectName, version));
+        Long retiredAt = null;
+        if (retired) {
+            retiredAt = readRetiredAt(objectName, version);
+        }
+        String state = retired
+                ? com.github.lisama569.objectstoragejava.dto.VersionState.RETIRED.name()
+                : (version == currentVersion
+                        ? com.github.lisama569.objectstoragejava.dto.VersionState.CURRENT.name()
+                        : com.github.lisama569.objectstoragejava.dto.VersionState.LIVE.name());
+        return new com.github.lisama569.objectstoragejava.dto.VersionInfo(
+                version, state, stored.checksum(), stored.contentChecksum(), stored.size(), retiredAt);
+    }
+
+    private Long readRetiredAt(String objectName, long version) {
+        try {
+            return Long.parseLong(Files.readString(layout.retiredMarker(objectName, version),
+                    StandardCharsets.UTF_8).trim());
+        } catch (IOException | NumberFormatException e) {
+            return null;
+        }
+    }
+
+    private long currentVersionNumber(String objectName) {
+        StoredObject current = currentVersionOrNull(objectName);
+        return current == null ? -1 : current.version();
     }
 
     private StoredObject currentVersionOrNull(String objectName) {
@@ -472,6 +727,68 @@ public class ObjectStorageService {
         } catch (IOException e) {
             throw new StorageException("Failed to parse version metadata " + vFile, e);
         }
+    }
+
+    /**
+     * Compute the content fingerprint: SHA-256 over the raw concatenated part bytes in part order.
+     * This depends only on the object's actual bytes, never on how they were split into parts.
+     */
+    private String sha256AssembledBytes(String objectName, String uploadId, int partCount) {
+        try {
+            java.security.MessageDigest digest = java.security.MessageDigest.getInstance("SHA-256");
+            byte[] buffer = new byte[BUFFER_SIZE];
+            for (int partNumber = 1; partNumber <= partCount; partNumber++) {
+                try (InputStream in = Files.newInputStream(
+                        layout.partFile(objectName, uploadId, partNumber))) {
+                    int read;
+                    while ((read = in.read(buffer)) != -1) {
+                        digest.update(buffer, 0, read);
+                    }
+                }
+            }
+            return HEX.formatHex(digest.digest());
+        } catch (IOException e) {
+            throw new StorageException("Failed to compute content checksum from staged parts", e);
+        } catch (java.security.NoSuchAlgorithmException e) {
+            throw new IllegalStateException("SHA-256 not available", e);
+        }
+    }
+
+    /**
+     * Find a still-readable (non-retired) version whose raw bytes have the given content fingerprint.
+     * Every historical version is considered: re-uploading bytes of an old version (not just the
+     * current one) reuses that version and adds no storage. Returns null when content is genuinely new.
+     */
+    private StoredObject findVersionByContent(String objectName, String contentChecksum) {
+        Path versionsDir = layout.versionsDir(objectName);
+        if (!Files.isDirectory(versionsDir)) {
+            return null;
+        }
+        List<Path> files = new ArrayList<>();
+        try (Stream<Path> stream = Files.list(versionsDir)) {
+            stream.filter(p -> p.getFileName().toString().matches("v\\d+\\.json"))
+                    .sorted(java.util.Comparator.comparingLong(
+                            (Path p) -> versionNumberOf(p)).reversed())
+                    .forEach(files::add);
+        } catch (IOException e) {
+            throw new StorageException("Failed to scan versions of " + objectName, e);
+        }
+        for (Path vFile : files) {
+            long v = versionNumberOf(vFile);
+            if (Files.exists(layout.retiredMarker(objectName, v))) {
+                continue; // retired versions are not readable and must not be resurrected
+            }
+            StoredObject stored = readVersionFile(vFile);
+            if (contentChecksum.equalsIgnoreCase(stored.contentChecksum())) {
+                return stored;
+            }
+        }
+        return null;
+    }
+
+    private static long versionNumberOf(Path versionFile) {
+        String name = versionFile.getFileName().toString();
+        return Long.parseLong(name.substring(1, name.length() - ".json".length()));
     }
 
     // ------------------------------------------------------------------ utilities

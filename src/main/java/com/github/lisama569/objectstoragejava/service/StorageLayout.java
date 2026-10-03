@@ -54,6 +54,10 @@ public class StorageLayout {
         return blobsDir;
     }
 
+    public Path objectDirRoot() {
+        return objectsDir;
+    }
+
     public Path blob(String checksum) {
         return blobsDir.resolve(checksum + ".dat");
     }
@@ -72,6 +76,11 @@ public class StorageLayout {
 
     public Path currentPointer(String objectName) {
         return objectDir(objectName).resolve("current");
+    }
+
+    /** Marker file placed next to vN.json when a version is explicitly retired. */
+    public Path retiredMarker(String objectName, long version) {
+        return versionsDir(objectName).resolve("v" + version + ".retired");
     }
 
     public Path uploadDir(String objectName, String uploadId) {
@@ -93,3 +102,4 @@ public class StorageLayout {
         }
     }
 }
+

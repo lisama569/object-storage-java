@@ -80,12 +80,15 @@ public class ObjectStorageController {
         return ResponseEntity.noContent().build();
     }
 
-    /** Read the current (latest committed) version. */
+    /**
+     * Read the current (latest committed) version; supports a single {@code bytes=} range.
+     * Metadata headers and the streamed bytes come from the SAME snapshot resolved in the service.
+     */
     @GetMapping("/{objectName}")
-    public ResponseEntity<StreamingResponseBody> get(@PathVariable String objectName) {
-        StoredObject meta = storageService.headObject(objectName);
-        InputStream in = storageService.readObject(objectName);
-        return streamResponse(objectName, meta, in);
+    public ResponseEntity<StreamingResponseBody> get(@PathVariable String objectName,
+                                                     @RequestHeader(value = HttpHeaders.RANGE, required = false)
+                                                     String rangeHeader) {
+        return toResponse(objectName, storageService.openCurrent(objectName, rangeHeader));
     }
 
     /** Metadata of the current version. */
@@ -94,30 +97,60 @@ public class ObjectStorageController {
         return storageService.headObject(objectName);
     }
 
-    /** Read a specific historical version (old versions are never overwritten). */
+    /** Read a specific historical version (old versions are never overwritten); range supported. */
     @GetMapping("/{objectName}/versions/{version}")
     public ResponseEntity<StreamingResponseBody> getVersion(@PathVariable String objectName,
-                                                            @PathVariable long version) {
-        StoredObject meta = storageService.getVersion(objectName, version);
-        InputStream in = storageService.readVersion(objectName, version);
-        return streamResponse(objectName, meta, in);
+                                                            @PathVariable long version,
+                                                            @RequestHeader(value = HttpHeaders.RANGE, required = false)
+                                                            String rangeHeader) {
+        return toResponse(objectName, storageService.openVersionSnapshot(objectName, version, rangeHeader));
     }
 
-    private ResponseEntity<StreamingResponseBody> streamResponse(String objectName,
-                                                                 StoredObject meta,
-                                                                 InputStream in) {
+    /** List versions and their state (CURRENT/LIVE/RETIRED). */
+    @GetMapping("/{objectName}/versions")
+    public java.util.List<com.github.lisama569.objectstoragejava.dto.VersionInfo> listVersions(
+            @PathVariable String objectName) {
+        return storageService.listVersions(objectName);
+    }
+
+    /** Retire a historical version; its unreferenced blobs become GC candidates. */
+    @DeleteMapping("/{objectName}/versions/{version}")
+    public com.github.lisama569.objectstoragejava.dto.VersionInfo retireVersion(
+            @PathVariable String objectName,
+            @PathVariable long version) {
+        return storageService.retireVersion(objectName, version);
+    }
+
+    private ResponseEntity<StreamingResponseBody> toResponse(
+            String objectName,
+            com.github.lisama569.objectstoragejava.dto.OpenedObject opened) {
+        StoredObject meta = opened.metadata();
         StreamingResponseBody body = out -> {
-            try (InputStream stream = in) {
+            // Closing the stream releases its blob-protection lease (also on client disconnect).
+            try (InputStream stream = opened.stream()) {
                 stream.transferTo(out);
             }
         };
         String filename = URLEncoder.encode(objectName, StandardCharsets.UTF_8).replace("+", "%20");
-        return ResponseEntity.ok()
+        var builder = (opened.ranged()
+                        ? ResponseEntity.status(org.springframework.http.HttpStatus.PARTIAL_CONTENT)
+                        : ResponseEntity.ok())
                 .header(HttpHeaders.CONTENT_TYPE, MediaType.APPLICATION_OCTET_STREAM_VALUE)
-                .header(HttpHeaders.CONTENT_LENGTH, Long.toString(meta.size()))
                 .header("X-Object-Version", Long.toString(meta.version()))
                 .header("X-Checksum-SHA256", meta.checksum())
-                .header(HttpHeaders.CONTENT_DISPOSITION, "attachment; filename*=UTF-8''" + filename)
-                .body(body);
+                .header("X-Content-Checksum-SHA256",
+                        meta.contentChecksum() == null ? "" : meta.contentChecksum())
+                .header(HttpHeaders.ACCEPT_RANGES, "bytes")
+                .header(HttpHeaders.CONTENT_DISPOSITION, "attachment; filename*=UTF-8''" + filename);
+
+        if (opened.ranged()) {
+            var range = opened.range();
+            builder.header(HttpHeaders.CONTENT_LENGTH, Long.toString(range.length()))
+                    .header(HttpHeaders.CONTENT_RANGE,
+                            "bytes " + range.start() + "-" + range.end() + "/" + meta.size());
+        } else {
+            builder.header(HttpHeaders.CONTENT_LENGTH, Long.toString(meta.size()));
+        }
+        return builder.body(body);
     }
 }
