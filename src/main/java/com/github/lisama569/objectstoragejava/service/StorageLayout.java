@@ -36,7 +36,9 @@ public class StorageLayout {
         this.blobsDir = this.root.resolve("blobs");
         this.objectsDir = this.root.resolve("objects");
         this.stagingDir = this.root.resolve("staging");
-        this.quarantineDir = this.blobsDir.resolve(".quarantine");
+        // Kept OUTSIDE blobs/ on purpose: tests (and operators) count files in blobs/ directly,
+        // and the quarantine area must never be mistaken for live or candidate blob storage.
+        this.quarantineDir = this.root.resolve("quarantine");
     }
 
     /** Validate an object name and return it unchanged. */
@@ -87,6 +89,36 @@ public class StorageLayout {
     /** Two-phase GC staging area: unreferenced blobs are moved here before final deletion. */
     public Path quarantineDir() {
         return quarantineDir;
+    }
+
+    /**
+     * Quarantine filename for a blob candidate. Suffixing the quarantine timestamp makes
+     * repeated GC passes of the same checksum (e.g. retried runs) never collide, while the
+     * original {@code <sha256>.dat} prefix stays recoverable.
+     */
+    public Path quarantineFile(String checksum, long quarantineTimestamp, long uniqueSuffix) {
+        return quarantineDir.resolve(checksum + ".dat.q" + quarantineTimestamp + "-" + uniqueSuffix);
+    }
+
+    /** Recover the blob checksum encoded in a quarantine filename produced by {@link #quarantineFile}. */
+    public static String checksumFromQuarantineFileName(String fileName) {
+        int marker = fileName.indexOf(".dat.q");
+        if (marker <= 0) {
+            throw new IllegalArgumentException("Not a quarantine file: " + fileName);
+        }
+        return fileName.substring(0, marker);
+    }
+
+    /** List committed object directories (single safe-name segments). */
+    public java.util.List<Path> objectDirectories() {
+        if (!Files.isDirectory(objectsDir)) {
+            return java.util.List.of();
+        }
+        try (java.util.stream.Stream<Path> entries = Files.list(objectsDir)) {
+            return entries.filter(Files::isDirectory).toList();
+        } catch (IOException e) {
+            throw new StorageException("Failed to list object directories under " + objectsDir, e);
+        }
     }
 
     /** Create the top-level directories. Called once at application startup. */

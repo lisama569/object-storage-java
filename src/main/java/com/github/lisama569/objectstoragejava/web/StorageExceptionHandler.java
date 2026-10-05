@@ -2,6 +2,7 @@ package com.github.lisama569.objectstoragejava.web;
 
 import com.github.lisama569.objectstoragejava.exception.ChecksumMismatchException;
 import com.github.lisama569.objectstoragejava.exception.InvalidManifestException;
+import com.github.lisama569.objectstoragejava.exception.InvalidRangeException;
 import com.github.lisama569.objectstoragejava.exception.StorageException;
 import com.github.lisama569.objectstoragejava.exception.UploadNotFoundException;
 import org.springframework.http.HttpStatus;
@@ -30,6 +31,14 @@ public class StorageExceptionHandler {
     public ResponseEntity<Map<String, String>> handleManifest(InvalidManifestException e) {
         return ResponseEntity.status(HttpStatus.BAD_REQUEST)
                 .body(Map.of("error", "invalid_manifest", "message", e.getMessage()));
+    }
+
+    /** Malformed Range header or range outside the version's byte extent. */
+    @ExceptionHandler(InvalidRangeException.class)
+    public ResponseEntity<Map<String, String>> handleRange(InvalidRangeException e) {
+        return ResponseEntity.status(HttpStatus.REQUESTED_RANGE_NOT_SATISFIABLE)
+                .header("Accept-Ranges", "bytes")
+                .body(Map.of("error", "invalid_range", "message", e.getMessage()));
     }
 
     @ExceptionHandler(StorageException.class)

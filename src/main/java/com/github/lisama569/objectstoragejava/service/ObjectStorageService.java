@@ -20,6 +20,7 @@ import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
 
 import java.io.BufferedInputStream;
+import java.io.FilterInputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
@@ -32,6 +33,7 @@ import java.security.NoSuchAlgorithmException;
 import java.util.ArrayList;
 import java.util.HexFormat;
 import java.util.List;
+import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.locks.Lock;
 import java.util.stream.Stream;
@@ -230,6 +232,8 @@ public class ObjectStorageService {
 
             // Every referenced part must exist on disk AND match the checksum claimed in the manifest.
             List<String> partChecksums = new ArrayList<>();
+            List<Long> partSizes = new ArrayList<>();
+            List<Path> partFiles = new ArrayList<>();
             long totalSize = 0;
             for (ManifestEntry entry : entries) {
                 Path partFile = layout.partFile(objectName, uploadId, entry.partNumber());
@@ -243,8 +247,11 @@ public class ObjectStorageService {
                     throw new ChecksumMismatchException("Manifest checksum for part " + entry.partNumber()
                             + " (" + entry.checksum() + ") does not match stored part (" + storedChecksum + ")");
                 }
-                totalSize += Files.size(partFile);
-                partChecksums.add(storedChecksum);
+                long partSize = Files.size(partFile);
+                totalSize += partSize;
+                partChecksums.add(storedChecksum.toLowerCase());
+                partSizes.add(partSize);
+                partFiles.add(partFile);
             }
 
             // Object-level checksum: chained digest over the ordered part checksums.
@@ -256,16 +263,57 @@ public class ObjectStorageService {
                         + manifest.checksum() + " but assembled object has " + computedChecksum);
             }
 
+            // Chunking-independent identity: SHA-256 over the assembled raw BYTES. Re-chunking the
+            // same byte content into any number/size of parts yields exactly the same digest.
+            String computedContentChecksum = digestAssembledBytes(partFiles);
+            if (manifest.contentChecksum() != null && !manifest.contentChecksum().isBlank()
+                    && !computedContentChecksum.equalsIgnoreCase(manifest.contentChecksum())) {
+                log.warn("Content checksum mismatch object={} expected={} computed={}",
+                        objectName, manifest.contentChecksum(), computedContentChecksum);
+                throw new ChecksumMismatchException("Content checksum mismatch: manifest claims "
+                        + manifest.contentChecksum() + " but assembled bytes have " + computedContentChecksum);
+            }
+            String contentChecksum = computedContentChecksum;
+
             StoredObject result;
             StoredObject current = currentVersionOrNull(objectName);
-            if (current != null && current.checksum().equalsIgnoreCase(computedChecksum)) {
-                // Identical content re-upload: no new version, no extra storage.
+            String currentContentChecksum = current == null ? null
+                    : (current.contentChecksum() != null ? current.contentChecksum()
+                    : digestVersionContent(current));
+            if (current != null
+                    && current.size() == totalSize
+                    && currentContentChecksum.equalsIgnoreCase(contentChecksum)) {
+                // Same raw bytes, regardless of how the upload was split into parts: reuse the
+                // current version AND its blobs. No version file, no blob and no storage is added.
+                String basis = "duplicate: SHA-256 over assembled " + totalSize + " bytes is "
+                        + contentChecksum + ", identical to current v" + current.version()
+                        + "; decision is independent of part count/part sizes";
                 result = new StoredObject(objectName, current.version(), current.checksum(),
-                        current.size(), current.partChecksums(), true);
-                log.info("Duplicate upload object={} checksum={} -> reuse version {} (no new storage)",
-                        objectName, computedChecksum, current.version());
+                        current.size(), current.partChecksums(), true,
+                        currentContentChecksum.toLowerCase(), current.partSizes(), basis);
+                log.info("Duplicate upload object={} contentChecksum={} -> reuse version {} (no new version, no new storage)",
+                        objectName, contentChecksum, current.version());
             } else {
-                result = publishVersion(objectName, uploadId, partChecksums, computedChecksum, totalSize);
+                String basis;
+                if (current == null) {
+                    basis = "new version: no current version exists; first publication";
+                } else {
+                    basis = "new version: assembled SHA-256 " + contentChecksum + " (" + totalSize
+                            + " bytes) differs from current v" + current.version() + " ("
+                            + currentContentChecksum + ", " + current.size() + " bytes)";
+                }
+                // Publication runs under the shared read gate so a concurrent GC pass cannot move
+                // a blob between materialisation and the live-reference scan.
+                final long finalTotalSize = totalSize;
+                final String finalBasis = basis;
+                result = readGate.runWithReadLock(() -> {
+                    try {
+                        return publishVersion(objectName, uploadId, partChecksums, partSizes,
+                                computedChecksum, contentChecksum, finalTotalSize, finalBasis);
+                    } catch (IOException e) {
+                        throw new StorageException("Failed to publish version for " + objectName, e);
+                    }
+                });
             }
 
             // Staging is only removed after publication; a failure before here leaves it resumable.
@@ -287,8 +335,9 @@ public class ObjectStorageService {
      * concurrently.
      */
     private StoredObject publishVersion(String objectName, String uploadId,
-                                        List<String> partChecksums, String objectChecksum,
-                                        long totalSize) throws IOException {
+                                        List<String> partChecksums, List<Long> partSizes,
+                                        String objectChecksum, String contentChecksum,
+                                        long totalSize, String dedupBasis) throws IOException {
         // Ensure every referenced content blob exists exactly once (deduplicated).
         int reusedBlobs = 0;
         for (int i = 0; i < partChecksums.size(); i++) {
@@ -300,9 +349,8 @@ public class ObjectStorageService {
         }
 
         long nextVersion = nextVersionNumber(objectName);
-        boolean allBlobsReused = reusedBlobs == partChecksums.size();
         StoredObject stored = new StoredObject(objectName, nextVersion, objectChecksum, totalSize,
-                List.copyOf(partChecksums), allBlobsReused);
+                List.copyOf(partChecksums), false, contentChecksum, List.copyOf(partSizes), dedupBasis);
 
         // Write version metadata to a temp file, then atomically rename into versions/.
         Path versionsDir = layout.versionsDir(objectName);
@@ -330,6 +378,62 @@ public class ObjectStorageService {
         log.info("Published version object={} version={} checksum={} size={} reusedBlobs={}",
                 objectName, nextVersion, objectChecksum, totalSize, reusedBlobs);
         return stored;
+    }
+
+    /**
+     * SHA-256 over the raw bytes of one upload session's ordered parts. This digest depends only
+     * on the assembled content, never on how it was split into parts.
+     */
+    private String digestAssembledBytes(List<Path> orderedPartFiles) {
+        try {
+            MessageDigest digest = MessageDigest.getInstance("SHA-256");
+            byte[] buffer = new byte[BUFFER_SIZE];
+            for (Path partFile : orderedPartFiles) {
+                try (InputStream in = new BufferedInputStream(Files.newInputStream(partFile))) {
+                    int read;
+                    while ((read = in.read(buffer)) != -1) {
+                        digest.update(buffer, 0, read);
+                    }
+                }
+            }
+            return HEX.formatHex(digest.digest());
+        } catch (NoSuchAlgorithmException e) {
+            throw new IllegalStateException("SHA-256 not available", e);
+        } catch (IOException e) {
+            throw new StorageException("Failed to compute content checksum from staged parts", e);
+        }
+    }
+
+    /**
+     * SHA-256 over the raw bytes of an already-committed version, streaming its referenced blobs
+     * in order. Used to backfill {@code contentChecksum} for metadata written before that field
+     * existed. The caller is responsible for holding the read gate when necessary.
+     */
+    String digestVersionContent(StoredObject version) {
+        try {
+            MessageDigest digest = MessageDigest.getInstance("SHA-256");
+            byte[] buffer = new byte[BUFFER_SIZE];
+            for (String partChecksum : version.partChecksums()) {
+                Path blob = layout.blob(partChecksum);
+                if (!Files.exists(blob)) {
+                    throw new StorageException("Version v" + version.version() + " of object "
+                            + version.objectName() + " references missing blob " + partChecksum
+                            + " — storage is corrupt");
+                }
+                try (InputStream in = new BufferedInputStream(Files.newInputStream(blob))) {
+                    int read;
+                    while ((read = in.read(buffer)) != -1) {
+                        digest.update(buffer, 0, read);
+                    }
+                }
+            }
+            return HEX.formatHex(digest.digest());
+        } catch (NoSuchAlgorithmException e) {
+            throw new IllegalStateException("SHA-256 not available", e);
+        } catch (IOException e) {
+            throw new StorageException("Failed to compute content checksum for version v"
+                    + version.version(), e);
+        }
     }
 
     /**
@@ -405,14 +509,54 @@ public class ObjectStorageService {
 
     // --------------------------------------------------------- new read / lifecycle APIs
 
-    /** Read a byte range of the current version from a single consistent metadata snapshot. */
+    /**
+     * Read the current version, optionally restricted to one validated byte range.
+     * The metadata snapshot and the byte stream are resolved as ONE unit: the current pointer is
+     * read once under the shared read gate, and every byte in the returned stream comes from that
+     * exact version's blobs. A version published concurrently afterwards can neither change the
+     * reported version nor the bytes, and garbage collection cannot reclaim those blobs before
+     * the stream is closed.
+     */
     public RangeReadResult readObjectRange(String objectName, String rangeHeader) {
-        return null;
+        layout.requireSafeName(objectName);
+        readGate.acquireRead();
+        boolean handedOff = false;
+        try {
+            StoredObject snapshot = currentVersionOrNull(objectName);
+            if (snapshot == null) {
+                throw new UploadNotFoundException("No committed version of object " + objectName);
+            }
+            ByteRange range = ByteRange.parse(rangeHeader, snapshot.size());
+            InputStream in = openVerifiedStream(snapshot, range);
+            handedOff = true;
+            return new RangeReadResult(snapshot, range, in);
+        } finally {
+            if (!handedOff) {
+                readGate.releaseRead();
+            }
+        }
     }
 
-    /** Read a byte range of a specific historical version. */
+    /**
+     * Read one specific historical version, optionally restricted to one validated byte range.
+     * The version metadata is snapshotted once under the read gate; the stream serves exactly
+     * that version regardless of later publications or pruning of OTHER versions.
+     */
     public RangeReadResult readVersionRange(String objectName, long version, String rangeHeader) {
-        return null;
+        layout.requireSafeName(objectName);
+        readGate.acquireRead();
+        boolean handedOff = false;
+        try {
+            StoredObject snapshot = getVersion(objectName, version);
+            ByteRange range = ByteRange.parse(rangeHeader, snapshot.size());
+            InputStream in = openVerifiedStream(snapshot, range);
+            handedOff = true;
+            return new RangeReadResult(snapshot, range, in);
+        } finally {
+            if (!handedOff) {
+                readGate.releaseRead();
+            }
+        }
     }
 
     /** Open the verified byte stream of one already-resolved immutable version snapshot. */
@@ -420,28 +564,251 @@ public class ObjectStorageService {
         return openVersionStream(version, null);
     }
 
-    /** Open a verified stream for the given version, optionally limited to an inclusive range. */
+    /**
+     * Open a verified stream for the given version snapshot, optionally limited to an inclusive
+     * range. Every blob that contributes bytes (including, for cross-part ranges, every part the
+     * range spans) is checksum-verified in full while its bytes are served. The shared read gate
+     * is held until the returned stream is closed.
+     */
     public InputStream openVersionStream(StoredObject version, ByteRange range) {
-        return null;
+        readGate.acquireRead();
+        boolean handedOff = false;
+        try {
+            InputStream in = openVerifiedStream(version, range);
+            handedOff = true;
+            return in;
+        } finally {
+            if (!handedOff) {
+                readGate.releaseRead();
+            }
+        }
     }
 
     /** List all committed versions of an object (version numbers ascending). */
-    public java.util.List<VersionSummary> listVersions(String objectName) {
-        return java.util.List.of();
+    public List<VersionSummary> listVersions(String objectName) {
+        layout.requireSafeName(objectName);
+        return readGate.runWithReadLock(() -> {
+            Path versionsDir = layout.versionsDir(objectName);
+            if (!Files.isDirectory(versionsDir)) {
+                throw new UploadNotFoundException("No committed version of object " + objectName);
+            }
+            List<StoredObject> versions = new ArrayList<>();
+            try (Stream<Path> files = Files.list(versionsDir)) {
+                files.filter(p -> p.getFileName().toString().matches("v\\d+\\.json"))
+                        .forEach(p -> versions.add(readVersionFile(p)));
+            } catch (IOException e) {
+                throw new StorageException("Failed to list versions of " + objectName, e);
+            }
+            versions.sort(java.util.Comparator.comparingLong(StoredObject::version));
+            return versions.stream().map(VersionSummary::from).toList();
+        });
     }
 
-    /** Remove historical versions beyond the given retention count; current is never removed. */
+    /**
+     * Remove historical versions beyond {@code retain} (the current version always survives and
+     * is part of the retained window). Only immutable version metadata files are deleted here;
+     * blob bytes are reclaimed later by garbage collection once no readable version references
+     * them. Returns exactly which versions remain readable and which were removed.
+     */
     public PruneResult pruneVersions(String objectName, int retain) {
-        return null;
+        layout.requireSafeName(objectName);
+        if (retain < 1) {
+            throw new InvalidManifestException("retain must be at least 1 (the current version is always kept)");
+        }
+        Lock lock = lockManager.lockFor(objectName);
+        lock.lock();
+        try {
+            return readGate.runWithReadLock(() -> {
+                StoredObject current = currentVersionOrNull(objectName);
+                if (current == null) {
+                    throw new UploadNotFoundException("No committed version of object " + objectName);
+                }
+                List<VersionSummary> all = listVersions(objectName);
+                List<Long> removed = new ArrayList<>();
+                // Keep the newest `retain` versions, which always includes the current pointer's
+                // target because pointer numbers never roll back.
+                List<VersionSummary> kept = all.size() <= retain
+                        ? all
+                        : all.subList(all.size() - retain, all.size());
+                java.util.Set<Long> keptNumbers = kept.stream().map(VersionSummary::version)
+                        .collect(java.util.stream.Collectors.toSet());
+                if (!keptNumbers.contains(current.version())) {
+                    throw new StorageException("Refusing to prune: current pointer v" + current.version()
+                            + " is outside the retained window — storage is corrupt", null);
+                }
+                for (VersionSummary v : all) {
+                    if (!keptNumbers.contains(v.version())) {
+                        try {
+                            Files.deleteIfExists(layout.versionFile(objectName, v.version()));
+                        } catch (IOException e) {
+                            throw new StorageException("Failed to remove version file v" + v.version(), e);
+                        }
+                        removed.add(v.version());
+                    }
+                }
+                List<Long> retained = kept.stream().map(VersionSummary::version).toList();
+                log.info("Pruned object={} retained={} removed={} (blobs reclaimed by GC later)",
+                        objectName, retained, removed);
+                return new PruneResult(objectName, current.version(), retained, removed);
+            });
+        } finally {
+            lock.unlock();
+        }
     }
 
-    /** Delete the whole object (all versions + pointer); its blobs become GC candidates. */
+    /**
+     * Delete the whole object: all version metadata, the current pointer and every staging
+     * session. Blobs are not touched here; they become garbage-collection candidates once no
+     * object references them, so an in-flight reader keeps working until it closes its stream.
+     */
     public void deleteObject(String objectName) {
+        layout.requireSafeName(objectName);
+        Lock lock = lockManager.lockFor(objectName);
+        lock.lock();
+        try {
+            readGate.runWithReadLock(() -> {
+                deleteRecursively(layout.objectDir(objectName));
+                deleteRecursively(stagingDirFor(objectName));
+                log.info("Deleted object={} (its blobs are GC candidates)", objectName);
+            });
+        } finally {
+            lock.unlock();
+        }
     }
 
-    /** Snapshot of every part checksum referenced by any still-readable version of any object. */
-    public java.util.Set<String> collectLiveBlobChecksums() {
-        return java.util.Set.of();
+    private Path stagingDirFor(String objectName) {
+        return layout.root().resolve("staging").resolve(objectName);
+    }
+
+    /**
+     * Snapshot of every part/blob checksum referenced by any still-readable version of any
+     * object. Computed under the read gate so it is consistent with concurrent publications.
+     */
+    public Set<String> collectLiveBlobChecksums() {
+        return readGate.runWithReadLock(this::collectLiveBlobChecksumsUnlocked);
+    }
+
+    /**
+     * Live-reference scan WITHOUT acquiring the read gate. Callers must already hold the gate
+     * (garbage collection holds the exclusive lock; publications hold a read permit).
+     */
+    Set<String> collectLiveBlobChecksumsUnlocked() {
+        Set<String> live = new java.util.HashSet<>();
+        for (Path objectDir : layout.objectDirectories()) {
+            String objectName = objectDir.getFileName().toString();
+            Path versionsDir = layout.versionsDir(objectName);
+            if (!Files.isDirectory(versionsDir)) {
+                continue;
+            }
+            try (Stream<Path> files = Files.list(versionsDir)) {
+                for (Path vFile : files.filter(p -> p.getFileName().toString().matches("v\\d+\\.json"))
+                        .toList()) {
+                    StoredObject meta = readVersionFile(vFile);
+                    live.addAll(meta.partChecksums());
+                }
+            } catch (IOException e) {
+                throw new StorageException("Failed to scan versions of " + objectName, e);
+            }
+        }
+        return live;
+    }
+
+    /**
+     * Build the verified, range-restricted byte stream of one immutable version snapshot.
+     * Called while holding one read-gate permit (the permit is released by the stream's close()).
+     */
+    private InputStream openVerifiedStream(StoredObject version, ByteRange range) {
+        List<String> parts = version.partChecksums();
+        List<Long> sizes = version.partSizes();
+        long total = 0;
+        for (int i = 0; i < parts.size(); i++) {
+            long partSize = sizes != null && i < sizes.size() && sizes.get(i) != null
+                    ? sizes.get(i) : sizeOfBlobQuietly(parts.get(i));
+            total += partSize;
+        }
+        if (total != version.size()) {
+            throw new StorageException("Version v" + version.version() + " of object " + version.objectName()
+                    + " metadata size " + version.size() + " disagrees with referenced blob sizes "
+                    + total + " — storage is corrupt", null);
+        }
+        // Absolute offsets of the first and last bytes to serve, across the concatenated parts.
+        long first = range == null ? 0 : range.start();
+        long last = range == null ? total - 1 : range.end();
+
+        // Walk parts once to locate the slice window of every part that contributes bytes.
+        // All such parts (including every part a cross-part range spans) are opened and verified.
+        List<InputStream> slices = new ArrayList<>();
+        try {
+            long offset = 0;
+            for (int i = 0; i < parts.size(); i++) {
+                long partSize = sizes != null && i < sizes.size() && sizes.get(i) != null
+                        ? sizes.get(i) : sizeOfBlobQuietly(parts.get(i));
+                long partStart = offset;
+                long partEnd = offset + partSize - 1;
+                if (partEnd >= first && partStart <= last) {
+                    long skip = Math.max(0, first - partStart);
+                    long limit = Math.min(partEnd, last) - partStart - skip + 1;
+                    slices.add(openVerifiedPartSlice(parts.get(i), skip, limit, i + 1, version));
+                }
+                offset += partSize;
+            }
+        } catch (RuntimeException | Error e) {
+            for (InputStream s : slices) {
+                try {
+                    s.close();
+                } catch (IOException suppressed) {
+                    e.addSuppressed(suppressed);
+                }
+            }
+            throw e;
+        }
+        InputStream sequence = new ChainedSlicesInputStream(slices);
+        return new GateReleasingInputStream(sequence, version, range, readGate);
+    }
+
+    private long sizeOfBlobQuietly(String checksum) {
+        try {
+            return Files.size(layout.blob(checksum));
+        } catch (IOException e) {
+            throw new StorageException("Failed to stat blob " + checksum + " — storage is corrupt", e);
+        }
+    }
+
+    /**
+     * Open one blob, skip {@code skip} bytes, expose exactly {@code limit} bytes to the reader
+     * and hash the WHOLE blob (skipped tail drained on close) to verify it against its
+     * content-addressed checksum. Slices are concatenated in {@link #openVerifiedStream}.
+     */
+    private InputStream openVerifiedPartSlice(String checksum, long skip, long limit, int partNumber,
+                                              StoredObject version) {
+        Path blob = layout.blob(checksum);
+        if (!Files.exists(blob)) {
+            throw new StorageException("Version v" + version.version() + " of object " + version.objectName()
+                    + " references missing blob " + checksum + " — storage is corrupt", null);
+        }
+        try {
+            MessageDigest digest = MessageDigest.getInstance("SHA-256");
+            InputStream raw = new BufferedInputStream(Files.newInputStream(blob));
+            // Discard the prefix that precedes the requested slice, but it is still part of the
+            // blob and MUST be folded into the digest — otherwise a corrupt prefix would escape
+            // verification on any non-zero-start range.
+            byte[] prefix = new byte[BUFFER_SIZE];
+            long remainingSkip = skip;
+            while (remainingSkip > 0) {
+                int n = raw.read(prefix, 0, (int) Math.min(prefix.length, remainingSkip));
+                if (n < 0) {
+                    raw.close();
+                    throw new StorageException("Blob " + checksum + " ended before requested offset", null);
+                }
+                digest.update(prefix, 0, n);
+                remainingSkip -= n;
+            }
+            return new VerifiedPartInputStream(raw, digest, checksum, limit, partNumber, version);
+        } catch (NoSuchAlgorithmException e) {
+            throw new IllegalStateException("SHA-256 not available", e);
+        } catch (IOException e) {
+            throw new StorageException("Failed to open blob " + checksum, e);
+        }
     }
 
     // ------------------------------------------------------------------ reads (legacy)
@@ -495,6 +862,209 @@ public class ObjectStorageService {
             return objectMapper.readValue(Files.readAllBytes(vFile), StoredObject.class);
         } catch (IOException e) {
             throw new StorageException("Failed to parse version metadata " + vFile, e);
+        }
+    }
+
+    // ------------------------------------------------------------------ stream internals
+
+    /**
+     * Concatenation of the per-part verified slices. Unlike {@link SequenceInputStream},
+     * {@code close()} drains and verifies EVERY part slice even when an earlier slice's
+     * checksum fails (failures are aggregated as suppressed exceptions), so a torn blob can
+     * never be silently hidden.
+     */
+    private static final class ChainedSlicesInputStream extends InputStream {
+
+        private final List<InputStream> slices;
+        private int index;
+        private boolean closed;
+
+        ChainedSlicesInputStream(List<InputStream> slices) {
+            this.slices = slices;
+        }
+
+        @Override
+        public int read() throws IOException {
+            while (index < slices.size()) {
+                int b = slices.get(index).read();
+                if (b != -1) {
+                    return b;
+                }
+                index++;
+            }
+            return -1;
+        }
+
+        @Override
+        public int read(byte[] b, int off, int len) throws IOException {
+            while (index < slices.size()) {
+                int n = slices.get(index).read(b, off, len);
+                if (n > 0) {
+                    return n;
+                }
+                if (n == 0) {
+                    return 0;
+                }
+                index++;
+            }
+            return -1;
+        }
+
+        @Override
+        public void close() throws IOException {
+            if (closed) {
+                return;
+            }
+            closed = true;
+            IOException first = null;
+            for (InputStream slice : slices) {
+                try {
+                    slice.close();
+                } catch (IOException e) {
+                    if (first == null) {
+                        first = e;
+                    } else {
+                        first.addSuppressed(e);
+                    }
+                }
+            }
+            if (first != null) {
+                throw first;
+            }
+        }
+    }
+
+    /**
+     * One verified slice of one content-addressed blob. At most {@code limit} bytes are exposed
+     * to the reader, but the WHOLE underlying blob is hashed (the unread tail is drained on
+     * close) so a cross-part range read still verifies every part it touches end to end.
+     */
+    private static final class VerifiedPartInputStream extends FilterInputStream {
+
+        private final MessageDigest digest;
+        private final String expectedChecksum;
+        private final long limit;
+        private final int partNumber;
+        private final StoredObject version;
+        private long exposed;
+        private boolean verified;
+        private boolean closed;
+
+        VerifiedPartInputStream(InputStream in, MessageDigest digest, String expectedChecksum,
+                                long limit, int partNumber, StoredObject version) {
+            super(in);
+            this.digest = digest;
+            this.expectedChecksum = expectedChecksum;
+            this.limit = limit;
+            this.partNumber = partNumber;
+            this.version = version;
+        }
+
+        @Override
+        public int read() throws IOException {
+            if (exposed >= limit) {
+                return -1;
+            }
+            int b = in.read();
+            if (b >= 0) {
+                digest.update((byte) b);
+                exposed++;
+            }
+            return b;
+        }
+
+        @Override
+        public int read(byte[] b, int off, int len) throws IOException {
+            if (len <= 0) {
+                return 0;
+            }
+            if (exposed >= limit) {
+                return -1;
+            }
+            int toRead = (int) Math.min(len, limit - exposed);
+            int n = in.read(b, off, toRead);
+            if (n > 0) {
+                digest.update(b, off, n);
+                exposed += n;
+            }
+            return n;
+        }
+
+        /** Read without exposing (folds bytes into the digest only). */
+        private int readSilently(byte[] b, int off, int len) throws IOException {
+            return in.read(b, off, len);
+        }
+
+        @Override
+        public void close() throws IOException {
+            if (closed) {
+                return;
+            }
+            closed = true;
+            try {
+                // Drain the remainder of this blob so its full content is checksum-verified even
+                // when the reader only asked for a prefix slice.
+                byte[] buffer = new byte[BUFFER_SIZE];
+                int n;
+                while ((n = readSilently(buffer, 0, buffer.length)) != -1) {
+                    digest.update(buffer, 0, n);
+                }
+                String actual = HexFormat.of().formatHex(digest.digest());
+                verified = true;
+                if (!actual.equalsIgnoreCase(expectedChecksum)) {
+                    throw new ChecksumMismatchException("Read-time verification failed for part "
+                            + partNumber + " of object " + version.objectName() + " v" + version.version()
+                            + ": blob " + expectedChecksum + " actually hashes to " + actual);
+                }
+            } finally {
+                super.close();
+            }
+        }
+    }
+
+    /**
+     * Wraps the concatenated verified part slices: on close it (1) closes every part slice,
+     * which triggers their checksum comparison, and (2) releases the read-gate permit so a
+     * blocked GC pass may proceed once this reader is truly done with the blobs.
+     */
+    private static final class GateReleasingInputStream extends FilterInputStream {
+
+        private final ReadGate gate;
+        private final StoredObject version;
+        private final ByteRange range;
+        private boolean closed;
+
+        GateReleasingInputStream(InputStream in, StoredObject version, ByteRange range, ReadGate gate) {
+            super(in);
+            this.version = version;
+            this.range = range;
+            this.gate = gate;
+        }
+
+        @Override
+        public void close() throws IOException {
+            if (closed) {
+                return;
+            }
+            closed = true;
+            IOException failure = null;
+            try {
+                super.close(); // closes all part slices -> checksum verification happens here
+            } catch (IOException e) {
+                failure = e;
+            } finally {
+                gate.releaseRead();
+            }
+            if (failure != null) {
+                throw failure;
+            }
+            if (range == null) {
+                log.debug("Full read verified object={} version={} parts={}",
+                        version.objectName(), version.version(), version.partChecksums().size());
+            } else {
+                log.debug("Range read verified object={} version={} range={}-{}",
+                        version.objectName(), version.version(), range.start(), range.end());
+            }
         }
     }
 

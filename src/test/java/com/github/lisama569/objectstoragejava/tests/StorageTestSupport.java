@@ -43,6 +43,16 @@ final class StorageTestSupport {
     /** Upload all parts and complete; returns the published (or reused) version. */
     static StoredObject multipartUpload(ObjectStorageService service, ChecksumService checksums,
                                         String objectName, List<byte[]> parts, String uploadId) {
+        return multipartUpload(service, checksums, objectName, parts, uploadId, false);
+    }
+
+    /**
+     * Upload all parts and complete. When {@code claimContentChecksum} is true the manifest also
+     * carries the chunking-independent SHA-256 over the assembled bytes.
+     */
+    static StoredObject multipartUpload(ObjectStorageService service, ChecksumService checksums,
+                                        String objectName, List<byte[]> parts, String uploadId,
+                                        boolean claimContentChecksum) {
         List<ManifestEntry> entries = new ArrayList<>();
         List<String> partChecksums = new ArrayList<>();
         for (int i = 0; i < parts.size(); i++) {
@@ -53,13 +63,22 @@ final class StorageTestSupport {
             partChecksums.add(checksum);
         }
         String objectChecksum = checksums.combinePartChecksums(partChecksums);
-        return service.completeUpload(objectName, uploadId, new ManifestRequest(objectChecksum, entries));
+        String contentChecksum = claimContentChecksum ? sha256(checksums, concat(parts)) : null;
+        return service.completeUpload(objectName, uploadId,
+                new ManifestRequest(objectChecksum, entries, contentChecksum));
     }
 
     static StoredObject multipartUpload(ObjectStorageService service, ChecksumService checksums,
                                         String objectName, List<byte[]> parts) {
         UploadInitResponse init = service.initUpload(objectName);
-        return multipartUpload(service, checksums, objectName, parts, init.uploadId());
+        return multipartUpload(service, checksums, objectName, parts, init.uploadId(), false);
+    }
+
+    /** Upload + complete with a manifest that also claims the assembled-bytes content checksum. */
+    static StoredObject multipartUploadWithContentChecksum(ObjectStorageService service, ChecksumService checksums,
+                                                           String objectName, List<byte[]> parts) {
+        UploadInitResponse init = service.initUpload(objectName);
+        return multipartUpload(service, checksums, objectName, parts, init.uploadId(), true);
     }
 
     static byte[] concat(List<byte[]> parts) {

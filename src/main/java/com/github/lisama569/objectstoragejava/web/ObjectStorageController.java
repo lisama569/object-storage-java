@@ -1,13 +1,19 @@
 package com.github.lisama569.objectstoragejava.web;
 
 import com.github.lisama569.objectstoragejava.dto.ChunkUploadResponse;
+import com.github.lisama569.objectstoragejava.dto.GcReport;
 import com.github.lisama569.objectstoragejava.dto.ManifestRequest;
+import com.github.lisama569.objectstoragejava.dto.PruneResult;
+import com.github.lisama569.objectstoragejava.dto.RangeReadResult;
 import com.github.lisama569.objectstoragejava.dto.StoredObject;
 import com.github.lisama569.objectstoragejava.dto.UploadInitResponse;
 import com.github.lisama569.objectstoragejava.dto.UploadStatusResponse;
+import com.github.lisama569.objectstoragejava.dto.VersionSummary;
 import com.github.lisama569.objectstoragejava.service.ObjectStorageService;
+import com.github.lisama569.objectstoragejava.service.StorageReclamationService;
 import jakarta.servlet.http.HttpServletRequest;
 import org.springframework.http.HttpHeaders;
+import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.DeleteMapping;
@@ -18,12 +24,14 @@ import org.springframework.web.bind.annotation.PutMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestHeader;
 import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 import org.springframework.web.servlet.mvc.method.annotation.StreamingResponseBody;
 
 import java.io.InputStream;
 import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
+import java.util.List;
 
 /** HTTP entry point for the local object-storage service. */
 @RestController
@@ -31,9 +39,12 @@ import java.nio.charset.StandardCharsets;
 public class ObjectStorageController {
 
     private final ObjectStorageService storageService;
+    private final StorageReclamationService reclamationService;
 
-    public ObjectStorageController(ObjectStorageService storageService) {
+    public ObjectStorageController(ObjectStorageService storageService,
+                                   StorageReclamationService reclamationService) {
         this.storageService = storageService;
+        this.reclamationService = reclamationService;
     }
 
     /** 1. Initialise a multipart upload. */
@@ -80,12 +91,15 @@ public class ObjectStorageController {
         return ResponseEntity.noContent().build();
     }
 
-    /** Read the current (latest committed) version. */
+    /** Read the current (latest committed) version; optional single byte range. */
     @GetMapping("/{objectName}")
-    public ResponseEntity<StreamingResponseBody> get(@PathVariable String objectName) {
-        StoredObject meta = storageService.headObject(objectName);
-        InputStream in = storageService.readObject(objectName);
-        return streamResponse(objectName, meta, in);
+    public ResponseEntity<StreamingResponseBody> get(@PathVariable String objectName,
+                                                     @RequestHeader(value = HttpHeaders.RANGE, required = false)
+                                                             String rangeHeader) {
+        // One single snapshot: metadata and bytes are resolved together, so a concurrent
+        // publication can never pair a new version header with old bytes (or vice versa).
+        RangeReadResult result = storageService.readObjectRange(objectName, rangeHeader);
+        return streamResponse(result);
     }
 
     /** Metadata of the current version. */
@@ -94,30 +108,69 @@ public class ObjectStorageController {
         return storageService.headObject(objectName);
     }
 
-    /** Read a specific historical version (old versions are never overwritten). */
-    @GetMapping("/{objectName}/versions/{version}")
-    public ResponseEntity<StreamingResponseBody> getVersion(@PathVariable String objectName,
-                                                            @PathVariable long version) {
-        StoredObject meta = storageService.getVersion(objectName, version);
-        InputStream in = storageService.readVersion(objectName, version);
-        return streamResponse(objectName, meta, in);
+    /** List all committed version numbers/metadata (ascending). */
+    @GetMapping("/{objectName}/versions")
+    public List<VersionSummary> versions(@PathVariable String objectName) {
+        return storageService.listVersions(objectName);
     }
 
-    private ResponseEntity<StreamingResponseBody> streamResponse(String objectName,
-                                                                 StoredObject meta,
-                                                                 InputStream in) {
+    /** Read a specific historical version (old versions are never overwritten); optional range. */
+    @GetMapping("/{objectName}/versions/{version}")
+    public ResponseEntity<StreamingResponseBody> getVersion(@PathVariable String objectName,
+                                                            @PathVariable long version,
+                                                            @RequestHeader(value = HttpHeaders.RANGE, required = false)
+                                                                    String rangeHeader) {
+        RangeReadResult result = storageService.readVersionRange(objectName, version, rangeHeader);
+        return streamResponse(result);
+    }
+
+    /** Retire historical versions, keeping the newest {@code retain} (current always survives). */
+    @PostMapping("/{objectName}/prune")
+    public PruneResult prune(@PathVariable String objectName,
+                             @RequestParam(defaultValue = "1") int retain) {
+        return storageService.pruneVersions(objectName, retain);
+    }
+
+    /** Delete the whole object (version metadata + pointer + staging); blobs become GC work. */
+    @DeleteMapping("/{objectName}")
+    public ResponseEntity<Void> deleteObject(@PathVariable String objectName) {
+        storageService.deleteObject(objectName);
+        return ResponseEntity.noContent().build();
+    }
+
+    /** Run one safe, retryable blob reclamation pass. */
+    @PostMapping("/admin/gc")
+    public GcReport collectGarbage(@RequestParam(value = "minAgeMillis", required = false)
+                                   Long minAgeMillis) {
+        return minAgeMillis == null
+                ? reclamationService.collectGarbage()
+                : reclamationService.collectGarbage(minAgeMillis);
+    }
+
+    private ResponseEntity<StreamingResponseBody> streamResponse(RangeReadResult result) {
+        StoredObject meta = result.version();
+        InputStream in = result.content();
         StreamingResponseBody body = out -> {
             try (InputStream stream = in) {
                 stream.transferTo(out);
             }
         };
-        String filename = URLEncoder.encode(objectName, StandardCharsets.UTF_8).replace("+", "%20");
-        return ResponseEntity.ok()
+        String filename = URLEncoder.encode(meta.objectName(), StandardCharsets.UTF_8).replace("+", "%20");
+        ResponseEntity.BodyBuilder builder = ResponseEntity.status(
+                        result.range() == null ? HttpStatus.OK : HttpStatus.PARTIAL_CONTENT)
+                .header(HttpHeaders.ACCEPT_RANGES, "bytes")
                 .header(HttpHeaders.CONTENT_TYPE, MediaType.APPLICATION_OCTET_STREAM_VALUE)
-                .header(HttpHeaders.CONTENT_LENGTH, Long.toString(meta.size()))
+                .header(HttpHeaders.CONTENT_LENGTH,
+                        Long.toString(result.range() == null ? meta.size() : result.range().length()))
                 .header("X-Object-Version", Long.toString(meta.version()))
                 .header("X-Checksum-SHA256", meta.checksum())
-                .header(HttpHeaders.CONTENT_DISPOSITION, "attachment; filename*=UTF-8''" + filename)
-                .body(body);
+                .header("X-Content-Checksum-SHA256",
+                        meta.contentChecksum() == null ? "" : meta.contentChecksum())
+                .header(HttpHeaders.CONTENT_DISPOSITION, "attachment; filename*=UTF-8''" + filename);
+        if (result.range() != null) {
+            builder.header(HttpHeaders.CONTENT_RANGE,
+                    "bytes " + result.range().start() + "-" + result.range().end() + "/" + meta.size());
+        }
+        return builder.body(body);
     }
 }

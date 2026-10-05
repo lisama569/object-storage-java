@@ -217,4 +217,107 @@ class ObjectStorageControllerTest {
                 .andExpect(content().bytes(good));
         System.out.printf("[http] aborted second upload; current checksum=%s remains%n", goodObj);
     }
+
+    /** Complete a one-part upload over HTTP; returns the object-level checksum. */
+    private String publishOnePart(String name, byte[] body) throws Exception {
+        String checksum = cs(body);
+        String objectCs = checksums.combinePartChecksums(List.of(checksum));
+        MvcResult init = mockMvc.perform(post("/api/objects/{name}/uploads", name)).andReturn();
+        String uploadId = json.readTree(init.getResponse().getContentAsByteArray()).get("uploadId").asText();
+        mockMvc.perform(put("/api/objects/{name}/uploads/{id}/parts/1", name, uploadId)
+                        .header("X-Checksum-SHA256", checksum)
+                        .content(body).contentType(MediaType.APPLICATION_OCTET_STREAM))
+                .andExpect(status().isOk());
+        String manifest = json.writeValueAsString(java.util.Map.of(
+                "checksum", objectCs,
+                "parts", List.of(java.util.Map.of("partNumber", 1, "checksum", checksum))));
+        mockMvc.perform(post("/api/objects/{name}/uploads/{id}/complete", name, uploadId)
+                        .contentType(MediaType.APPLICATION_JSON).content(manifest))
+                .andExpect(status().isOk());
+        return objectCs;
+    }
+
+    @Test
+    void rangeReadReturnsPartialContentWithContentRangeAndExactSlice() throws Exception {
+        byte[] body = "0123456789abcdefghij".getBytes(StandardCharsets.UTF_8); // 20 bytes
+        publishOnePart("ranged-http", body);
+
+        // start-end
+        MvcResult async = mockMvc.perform(get("/api/objects/ranged-http").header("Range", "bytes=5-9"))
+                .andReturn();
+        mockMvc.perform(asyncDispatch(async))
+                .andExpect(status().isPartialContent())
+                .andExpect(header().string("Content-Range", "bytes 5-9/20"))
+                .andExpect(header().string("Accept-Ranges", "bytes"))
+                .andExpect(header().string("X-Object-Version", "1"))
+                .andExpect(content().bytes("56789".getBytes(StandardCharsets.UTF_8)));
+
+        // open-ended on a historical version
+        MvcResult async2 = mockMvc.perform(
+                get("/api/objects/ranged-http/versions/1").header("Range", "bytes=15-")).andReturn();
+        mockMvc.perform(asyncDispatch(async2))
+                .andExpect(status().isPartialContent())
+                .andExpect(header().string("Content-Range", "bytes 15-19/20"))
+                .andExpect(content().bytes("fghij".getBytes(StandardCharsets.UTF_8)));
+
+        // suffix
+        MvcResult async3 = mockMvc.perform(
+                get("/api/objects/ranged-http").header("Range", "bytes=-4")).andReturn();
+        mockMvc.perform(asyncDispatch(async3))
+                .andExpect(status().isPartialContent())
+                .andExpect(content().bytes("ghij".getBytes(StandardCharsets.UTF_8)));
+        System.out.println("[http-range] 206 partial content + Content-Range served for all three forms");
+    }
+
+    @Test
+    void badRangeReturns416WithDistinguishableError() throws Exception {
+        publishOnePart("small-http", "0123456789".getBytes(StandardCharsets.UTF_8));
+
+        mockMvc.perform(get("/api/objects/small-http").header("Range", "bytes=100-200"))
+                .andExpect(status().isRequestedRangeNotSatisfiable())
+                .andExpect(jsonPath("$.error").value("invalid_range"));
+        mockMvc.perform(get("/api/objects/small-http").header("Range", "bytes=9-2"))
+                .andExpect(status().isRequestedRangeNotSatisfiable())
+                .andExpect(jsonPath("$.error").value("invalid_range"));
+        System.out.println("[http-range] malformed/unsatisfiable ranges -> 416 invalid_range");
+    }
+
+    @Test
+    void versionsListingPruneAndGcWorkOverHttp() throws Exception {
+        publishOnePart("lifecycle-http", "version-one-only".getBytes(StandardCharsets.UTF_8));
+        publishOnePart("lifecycle-http", "version-two-only".getBytes(StandardCharsets.UTF_8));
+        publishOnePart("lifecycle-http", "version-three!!".getBytes(StandardCharsets.UTF_8));
+
+        // listing
+        mockMvc.perform(get("/api/objects/lifecycle-http/versions"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.length()").value(3))
+                .andExpect(jsonPath("$[2].version").value(3));
+
+        // prune keeps newest 1
+        mockMvc.perform(post("/api/objects/lifecycle-http/prune").param("retain", "1"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.retainedVersions[0]").value(3))
+                .andExpect(jsonPath("$.removedVersions[0]").value(1))
+                .andExpect(jsonPath("$.removedVersions[1]").value(2));
+
+        // removed version 404s, current still served
+        mockMvc.perform(get("/api/objects/lifecycle-http/versions/1"))
+                .andExpect(status().isNotFound());
+        MvcResult async = mockMvc.perform(get("/api/objects/lifecycle-http")).andReturn();
+        mockMvc.perform(asyncDispatch(async))
+                .andExpect(status().isOk())
+                .andExpect(header().string("X-Object-Version", "3"))
+                .andExpect(content().bytes("version-three!!".getBytes(StandardCharsets.UTF_8)));
+
+        // GC reclaims the orphaned blobs and is repeatable
+        mockMvc.perform(post("/api/objects/admin/gc").param("minAgeMillis", "0"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.deleted").isNumber());
+        mockMvc.perform(post("/api/objects/admin/gc").param("minAgeMillis", "0"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.quarantined").value(0))
+                .andExpect(jsonPath("$.deleted").value(0));
+        System.out.println("[http-lifecycle] versions list/prune/GC over HTTP; second GC deletes nothing");
+    }
 }
