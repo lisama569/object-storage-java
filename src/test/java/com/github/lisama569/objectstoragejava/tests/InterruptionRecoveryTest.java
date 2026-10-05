@@ -57,7 +57,7 @@ class InterruptionRecoveryTest {
         StoredObject headAfterCrash = stack.service().headObject("data.bin");
         assertEquals(v1Meta.version(), headAfterCrash.version(), "crash must not advance the version");
         assertEquals(v1Meta.checksum(), headAfterCrash.checksum());
-        byte[] oldBytes = stack.service().readObject("data.bin").readAllBytes();
+        byte[] oldBytes = StorageTestSupport.readAll(stack.service().readObject("data.bin"));
         assertTrue(java.util.Arrays.equals(StorageTestSupport.concat(v1), oldBytes),
                 "old version bytes must survive the crash untouched");
         System.out.printf("[crash] after interrupted part-2: current=v%d checksum=%s (unchanged)%n",
@@ -85,10 +85,10 @@ class InterruptionRecoveryTest {
 
         assertEquals(2, v2Meta.version());
         assertEquals(objectCs, v2Meta.checksum());
-        byte[] v2Bytes = restarted.service().readObject("data.bin").readAllBytes();
+        byte[] v2Bytes = StorageTestSupport.readAll(restarted.service().readObject("data.bin"));
         byte[] expectedV2 = StorageTestSupport.concat(List.of(part1, part2));
         assertTrue(java.util.Arrays.equals(expectedV2, v2Bytes), "resumed object must be byte-exact");
-        byte[] v1Again = restarted.service().readVersion("data.bin", 1).readAllBytes();
+        byte[] v1Again = StorageTestSupport.readAll(restarted.service().readVersion("data.bin", 1));
         assertTrue(java.util.Arrays.equals(StorageTestSupport.concat(v1), v1Again),
                 "historical v1 must still be readable after v2 resume");
         System.out.printf("[restart] resumed completion -> current=v%d checksum=%s; v1 also still readable%n",

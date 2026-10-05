@@ -49,7 +49,7 @@ class ObjectStorageServiceTest {
         System.out.printf("[version] object=%s published version=%d checksum=%s (decision: first publish)%n",
                 "doc.txt", v1.version(), v1.checksum());
 
-        byte[] readBack = stack.service().readObject("doc.txt").readAllBytes();
+        byte[] readBack = StorageTestSupport.readAll(stack.service().readObject("doc.txt"));
         assertArrayEquals(StorageTestSupport.concat(parts), readBack);
         assertEquals("doc.txt", v1.objectName());
     }
@@ -93,8 +93,8 @@ class ObjectStorageServiceTest {
         StoredObject head = stack.service().headObject("evolving");
         assertEquals(2, head.version(), "current pointer must move forward");
 
-        byte[] oldBytes = stack.service().readVersion("evolving", 1).readAllBytes();
-        byte[] newBytes = stack.service().readObject("evolving").readAllBytes();
+        byte[] oldBytes = StorageTestSupport.readAll(stack.service().readVersion("evolving", 1));
+        byte[] newBytes = StorageTestSupport.readAll(stack.service().readObject("evolving"));
         assertArrayEquals(StorageTestSupport.concat(v1Parts), oldBytes, "old version must stay readable forever");
         assertArrayEquals(StorageTestSupport.concat(v2Parts), newBytes);
         System.out.printf("[version] decision: content differs v1=%s -> publish v2=%s; v1 still readable%n",

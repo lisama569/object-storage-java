@@ -36,7 +36,9 @@ public class StorageLayout {
         this.blobsDir = this.root.resolve("blobs");
         this.objectsDir = this.root.resolve("objects");
         this.stagingDir = this.root.resolve("staging");
-        this.quarantineDir = this.blobsDir.resolve(".quarantine");
+        // Kept OUTSIDE blobs/ so that a plain listing of blobs/ contains nothing but blob files,
+        // and so a crashed quarantine never looks like live content-addressed storage.
+        this.quarantineDir = this.root.resolve("quarantine");
     }
 
     /** Validate an object name and return it unchanged. */
@@ -87,6 +89,11 @@ public class StorageLayout {
     /** Two-phase GC staging area: unreferenced blobs are moved here before final deletion. */
     public Path quarantineDir() {
         return quarantineDir;
+    }
+
+    /** Path of a quarantined copy of the blob with the given checksum. */
+    public Path quarantineBlob(String checksum) {
+        return quarantineDir.resolve(checksum + ".dat");
     }
 
     /** Create the top-level directories. Called once at application startup. */

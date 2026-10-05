@@ -57,4 +57,30 @@ public class ChecksumService {
     public String toHex(byte[] digestBytes) {
         return HEX.formatHex(digestBytes);
     }
+
+    /**
+     * Fresh {@link MessageDigest} for callers that hash a concatenation of streams themselves
+     * (e.g. the chunking-independent assembled-object digest).
+     */
+    public MessageDigest newSha256Digest() {
+        try {
+            return MessageDigest.getInstance("SHA-256");
+        } catch (NoSuchAlgorithmException e) {
+            throw new IllegalStateException("SHA-256 not available", e);
+        }
+    }
+
+    /**
+     * Verify that the given stream hashes to {@code expectedHex}; the stream is consumed fully.
+     *
+     * @throws com.github.lisama569.objectstoragejava.exception.ChecksumMismatchException
+     *         when the computed digest differs (case-insensitive comparison)
+     */
+    public void verifyHex(InputStream in, String expectedHex) {
+        String actual = sha256(in);
+        if (!actual.equalsIgnoreCase(expectedHex)) {
+            throw new com.github.lisama569.objectstoragejava.exception.ChecksumMismatchException(
+                    "Content verification failed: expected " + expectedHex + " but computed " + actual);
+        }
+    }
 }

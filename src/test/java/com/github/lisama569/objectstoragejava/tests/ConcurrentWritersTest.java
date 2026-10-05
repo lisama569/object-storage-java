@@ -168,7 +168,7 @@ class ConcurrentWritersTest {
         assertEquals(writers, publishedVersions.size(), "every distinct writer must publish one version");
         for (long v = 1; v <= writers; v++) {
             StoredObject meta = stack.service().getVersion("shared.log", v);
-            byte[] bytes = stack.service().readVersion("shared.log", v).readAllBytes();
+            byte[] bytes = StorageTestSupport.readAll(stack.service().readVersion("shared.log", v));
             byte[] expected = payloadByChecksum.get(meta.checksum());
             assertTrue(java.util.Arrays.equals(bytes, expected), "version " + v + " bytes must be exact");
         }
@@ -189,7 +189,7 @@ class ConcurrentWritersTest {
         StoredObject finalVersion = StorageTestSupport.multipartUpload(
                 stack.service(), stack.checksums(), "shared.log", sentinel);
         assertEquals(writers + 1L, finalVersion.version(), "sentinel must land at a deterministic version");
-        byte[] finalBytes = stack.service().readObject("shared.log").readAllBytes();
+        byte[] finalBytes = StorageTestSupport.readAll(stack.service().readObject("shared.log"));
         assertTrue(java.util.Arrays.equals(StorageTestSupport.concat(sentinel), finalBytes),
                 "final bytes must be exactly the sentinel content");
         System.out.printf("[concurrent] FINAL decision: current=v%d checksum=%s (deterministic sentinel)%n",
@@ -242,7 +242,7 @@ class ConcurrentWritersTest {
             System.out.printf("[dedup-storm] decision: all %d writers reuse v1; blobs=%d checksum=%s%n",
                     writers, blobCount, objectChecksum);
         }
-        byte[] read = stack.service().readObject("same.bin").readAllBytes();
+        byte[] read = StorageTestSupport.readAll(stack.service().readObject("same.bin"));
         assertTrue(java.util.Arrays.equals(StorageTestSupport.concat(sharedParts), read));
     }
 }
